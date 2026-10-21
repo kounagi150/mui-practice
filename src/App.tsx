@@ -6,6 +6,7 @@ import Accordion from '@mui/material/Accordion'
 import AccordionDetails from '@mui/material/AccordionDetails'
 import AccordionSummary from '@mui/material/AccordionSummary'
 import Chip from '@mui/material/Chip'
+import CssBaseline from '@mui/material/CssBaseline'
 import Dialog from '@mui/material/Dialog'
 import FormControlLabel from '@mui/material/FormControlLabel'
 import LinearProgress from '@mui/material/LinearProgress'
@@ -19,7 +20,9 @@ import TableHead from '@mui/material/TableHead'
 import TableRow from '@mui/material/TableRow'
 import TextField from '@mui/material/TextField'
 import ToggleButton from '@mui/material/ToggleButton'
-import { useEffect, useState } from 'react'
+import { createTheme, ThemeProvider } from '@mui/material/styles'
+import type { PaletteMode } from '@mui/material'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 type WishlistItem = {
   id: number
@@ -41,6 +44,8 @@ const initialWishlist: WishlistItem[] = [
 const yen = new Intl.NumberFormat('ja-JP', { style: 'currency', currency: 'JPY' })
 const wishlistStorageKey = 'wishlist-items'
 const budgetStorageKey = 'wishlist-budget'
+const themeModeStorageKey = 'wishlist-theme-mode'
+const csvHeaders = ['id', 'name', 'price', 'url', 'priority', 'status', 'category'] as const
 const categories = ['その他', '家電', 'ゲーム', '本', '衣類', '趣味'] as const
 const priorityOrder = { 高: 0, 中: 1, 低: 2 } as const
 const priorityColors = { 高: 'error', 中: 'warning', 低: 'info' } as const
@@ -90,6 +95,79 @@ const loadBudget = () => {
   }
 }
 
+const loadThemeMode = (): PaletteMode => {
+  try {
+    return localStorage.getItem(themeModeStorageKey) === 'dark' ? 'dark' : 'light'
+  } catch {
+    return 'light'
+  }
+}
+
+const escapeCsvValue = (value: string | number) => {
+  const text = String(value)
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
+}
+
+const parseCsvLine = (line: string) => {
+  const values: string[] = []
+  let value = ''
+  let inQuotes = false
+
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]
+    if (character === '"') {
+      if (inQuotes && line[index + 1] === '"') {
+        value += '"'
+        index += 1
+      } else {
+        inQuotes = !inQuotes
+      }
+    } else if (character === ',' && !inQuotes) {
+      values.push(value)
+      value = ''
+    } else {
+      value += character
+    }
+  }
+
+  if (inQuotes) throw new Error('CSVの引用符が閉じられていません。')
+  values.push(value)
+  return values
+}
+
+const parseWishlistCsv = (text: string): WishlistItem[] => {
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).filter((line) => line.trim() !== '')
+  if (lines.length < 2) throw new Error('CSVに商品データがありません。')
+
+  const headers = parseCsvLine(lines[0])
+  if (headers.length !== csvHeaders.length || headers.some((header, index) => header !== csvHeaders[index])) {
+    throw new Error(`CSVの見出しは ${csvHeaders.join(',')} の順で指定してください。`)
+  }
+
+  const items = lines.slice(1).map((line, index) => {
+    const values = parseCsvLine(line)
+    if (values.length !== csvHeaders.length) {
+      throw new Error(`${index + 2}行目の項目数が正しくありません。`)
+    }
+
+    const [id, name, price, url, priority, status, category] = values
+    const item = normalizeWishlistItem({
+      id: Number(id),
+      name,
+      price: Number(price),
+      url,
+      priority,
+      status,
+      category,
+    })
+    if (!item) throw new Error(`${index + 2}行目の商品データが正しくありません。`)
+    if (!isOptionalHttpUrl(item.url)) throw new Error(`${index + 2}行目の商品URLが正しくありません。`)
+    return item
+  })
+
+  return items
+}
+
 const isOptionalHttpUrl = (value: string) => {
   const url = value.trim()
   if (!url) return true
@@ -120,6 +198,14 @@ function App() {
   const [notification, setNotification] = useState('')
   const [editingItem, setEditingItem] = useState<WishlistItem | null>(null)
   const [deletingItem, setDeletingItem] = useState<WishlistItem | null>(null)
+  const [themeMode, setThemeMode] = useState<PaletteMode>(loadThemeMode)
+  const importInputRef = useRef<HTMLInputElement>(null)
+  const theme = useMemo(() => createTheme({
+    palette: { mode: themeMode },
+    typography: {
+      fontFamily: "'DotGothic16', sans-serif",
+    },
+  }), [themeMode])
 
   useEffect(() => {
     try {
@@ -136,6 +222,43 @@ function App() {
       // 予算は画面上では継続して使えます。
     }
   }, [budget])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(themeModeStorageKey, themeMode)
+    } catch {
+      // テーマ設定を保存できない場合も、現在の画面では切り替えを反映します。
+    }
+  }, [themeMode])
+
+  const exportCsv = () => {
+    const rows = wishlist.map((item) => csvHeaders.map((header) => escapeCsvValue(item[header])))
+    const csv = [csvHeaders.join(','), ...rows.map((row) => row.join(','))].join('\r\n')
+    const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'wishlist-items.csv'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+    setNotification('CSVをエクスポートしました。')
+  }
+
+  const importCsv = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+
+    try {
+      const importedItems = parseWishlistCsv(await file.text())
+      setWishlist(importedItems)
+      setNotification(`${importedItems.length}件の商品をインポートしました。`)
+    } catch (error) {
+      setNotification(error instanceof Error ? `CSVを読み込めませんでした：${error.message}` : 'CSVを読み込めませんでした。')
+    }
+  }
 
   const addWishlistItem = () => {
     const name = productName.trim()
@@ -220,10 +343,22 @@ function App() {
   })
 
   return (
-    <main className="min-h-screen bg-slate-50 px-4 py-10 text-slate-900 sm:px-8">
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <main className={`min-h-screen px-4 py-6 sm:px-8 sm:py-10 ${themeMode === 'dark' ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'}`}>
       <div className="mx-auto max-w-5xl">
-        <h1 className="text-3xl font-bold">欲しいもの管理</h1>
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <h1 className="text-3xl font-bold">欲しいもの管理</h1>
+          <Button variant="outlined" onClick={() => setThemeMode((mode) => mode === 'light' ? 'dark' : 'light')}>
+            {themeMode === 'light' ? 'ダークテーマ' : 'ライトテーマ'}
+          </Button>
+        </div>
         <p className="mt-3 text-slate-600">欲しいものを一覧で確認できます。登録内容はこのブラウザに保存されます。</p>
+        <div className="mt-4 flex flex-wrap gap-3">
+          <Button variant="outlined" onClick={exportCsv}>CSVをエクスポート</Button>
+          <Button variant="outlined" onClick={() => importInputRef.current?.click()}>CSVをインポート</Button>
+          <input ref={importInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={importCsv} />
+        </div>
         <section aria-labelledby="registration-heading" className="mt-8">
           <h2 id="registration-heading" className="mb-4 text-xl font-semibold">欲しいものを入力</h2>
           {formError && (
@@ -231,62 +366,61 @@ function App() {
               {formError}
             </Alert>
           )}
-          <TextField
-            id="product-name"
-            label="商品名"
-            value={productName}
-            onChange={(event) => setProductName(event.target.value)}
-            fullWidth
-            helperText="商品名を入力してください。"
-          />
-          <TextField
-            id="product-price"
-            label="値段"
-            type="number"
-            value={productPrice}
-            onChange={(event) => setProductPrice(event.target.value)}
-            slotProps={{ htmlInput: { min: 0, step: 1 } }}
-            fullWidth
-            className="mt-4"
-            helperText="未入力の場合は0円として登録します。"
-          />
-          <TextField
-            id="product-url"
-            label="商品URL"
-            type="url"
-            value={productUrl}
-            onChange={(event) => setProductUrl(event.target.value)}
-            fullWidth
-            className="mt-4"
-            helperText="未入力でも登録できます。"
-          />
-          <div className="mt-4">
-            <label htmlFor="product-category" className="mr-4 text-sm font-medium">カテゴリー</label>
-            <Select native id="product-category" value={productCategory} onChange={(event) => setProductCategory(event.target.value)} inputProps={{ 'aria-label': 'カテゴリー' }}>
-              {categories.map((category) => <option key={category} value={category}>{category}</option>)}
-            </Select>
-          </div>
-          <div className="mt-4">
-            <label htmlFor="priority" className="mr-4 text-sm font-medium">優先度</label>
-            <Select
-              native
-              id="priority"
-              value={priority}
-              onChange={(event) => setPriority(event.target.value)}
-              inputProps={{ 'aria-label': '優先度' }}
+          <div className="grid gap-4 md:grid-cols-2">
+            <TextField
+              id="product-name"
+              label="商品名"
+              value={productName}
+              onChange={(event) => setProductName(event.target.value)}
+              fullWidth
+              helperText="商品名を入力してください。"
+            />
+            <TextField
+              id="product-price"
+              label="値段"
+              type="number"
+              value={productPrice}
+              onChange={(event) => setProductPrice(event.target.value)}
+              slotProps={{ htmlInput: { min: 0, step: 1 } }}
+              fullWidth
+              helperText="未入力の場合は0円として登録します。"
+            />
+            <TextField
+              id="product-url"
+              label="商品URL"
+              type="url"
+              value={productUrl}
+              onChange={(event) => setProductUrl(event.target.value)}
+              fullWidth
+              helperText="未入力でも登録できます。"
+            />
+            <div>
+              <label htmlFor="product-category" className="mr-4 text-sm font-medium">カテゴリー</label>
+              <Select native id="product-category" value={productCategory} onChange={(event) => setProductCategory(event.target.value)} inputProps={{ 'aria-label': 'カテゴリー' }}>
+                {categories.map((category) => <option key={category} value={category}>{category}</option>)}
+              </Select>
+            </div>
+            <div>
+              <label htmlFor="priority" className="mr-4 text-sm font-medium">優先度</label>
+              <Select
+                native
+                id="priority"
+                value={priority}
+                onChange={(event) => setPriority(event.target.value)}
+                inputProps={{ 'aria-label': '優先度' }}
+              >
+                <option value="高">高</option>
+                <option value="中">中</option>
+                <option value="低">低</option>
+              </Select>
+            </div>
+            <Button
+              variant="contained"
+              onClick={addWishlistItem}
             >
-              <option value="高">高</option>
-              <option value="中">中</option>
-              <option value="低">低</option>
-            </Select>
+              一覧に登録
+            </Button>
           </div>
-          <Button
-            variant="contained"
-            className="mt-4"
-            onClick={addWishlistItem}
-          >
-            一覧に登録
-          </Button>
         </section>
         <section aria-labelledby="wishlist-heading" className="mt-10">
           <h2 id="wishlist-heading" className="text-xl font-semibold">欲しいもの一覧（{displayedWishlist.length}件／全{wishlist.length}件）</h2>
@@ -545,7 +679,8 @@ function App() {
         )}
       </Dialog>
       <Snackbar open={Boolean(notification)} autoHideDuration={3000} onClose={() => setNotification('')} message={notification} />
-    </main>
+      </main>
+    </ThemeProvider>
   )
 }
 
